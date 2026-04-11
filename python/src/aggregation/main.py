@@ -23,21 +23,29 @@ class AggregationFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        self.fruit_top = []
+        self.fruit_top_by_client = {}
 
-    def _process_data(self, fruit, amount):
+    def _get_client_fruit_top(self, client_id):
+        if client_id not in self.fruit_top_by_client:
+            self.fruit_top_by_client[client_id] = []
+        return self.fruit_top_by_client[client_id]
+
+    def _process_data(self, client_id, fruit, amount):
         logging.info("Processing data message")
-        for i in range(len(self.fruit_top)):
-            if self.fruit_top[i].fruit == fruit:
-                self.fruit_top[i] = self.fruit_top[i] + fruit_item.FruitItem(
+        client_fruit_top = self._get_client_fruit_top(client_id)
+        for i in range(len(client_fruit_top)):
+            if client_fruit_top[i].fruit == fruit:
+                updated_fruit_item = client_fruit_top.pop(i) + fruit_item.FruitItem(
                     fruit, amount
                 )
+                bisect.insort(client_fruit_top, updated_fruit_item)
                 return
-        bisect.insort(self.fruit_top, fruit_item.FruitItem(fruit, amount))
+        bisect.insort(client_fruit_top, fruit_item.FruitItem(fruit, amount))
 
-    def _process_eof(self):
+    def _process_eof(self, client_id):
         logging.info("Received EOF")
-        fruit_chunk = list(self.fruit_top[-TOP_SIZE:])
+        client_fruit_top = self.fruit_top_by_client.get(client_id, [])
+        fruit_chunk = list(client_fruit_top[-TOP_SIZE:])
         fruit_chunk.reverse()
         fruit_top = list(
             map(
@@ -45,16 +53,25 @@ class AggregationFilter:
                 fruit_chunk,
             )
         )
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
-        del self.fruit_top
+        self.output_queue.send(
+            message_protocol.internal.serialize(
+                message_protocol.internal.build_aggregation_partial(client_id, fruit_top)
+            )
+        )
+        self.fruit_top_by_client.pop(client_id, None)
 
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")
         fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
+        parsed_message = message_protocol.internal.parse_sum_message(fields)
+        if parsed_message[0] == "data":
+            _, client_id, fruit, amount = parsed_message
+            self._process_data(client_id, fruit, amount)
+        elif parsed_message[0] == "eof":
+            _, client_id = parsed_message
+            self._process_eof(client_id)
         else:
-            self._process_eof()
+            raise ValueError(f"Invalid message format for aggregation: {fields}")
         ack()
 
     def start(self):

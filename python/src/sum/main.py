@@ -1,6 +1,5 @@
 import os
 import logging
-import threading
 
 from common import middleware, message_protocol, fruit_item
 
@@ -24,35 +23,57 @@ class SumFilter:
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             )
             self.data_output_exchanges.append(data_output_exchange)
-        self.amount_by_fruit = {}
+        self.amount_by_fruit_by_client = {}
 
-    def _process_data(self, fruit, amount):
+    def _get_client_amount_by_fruit(self, client_id):
+        if client_id not in self.amount_by_fruit_by_client:
+            self.amount_by_fruit_by_client[client_id] = {}
+        return self.amount_by_fruit_by_client[client_id]
+
+    def _process_data(self, _client_id, fruit, amount):
         logging.info(f"Process data")
-        self.amount_by_fruit[fruit] = self.amount_by_fruit.get(
+        amount_by_fruit = self._get_client_amount_by_fruit(_client_id)
+        amount_by_fruit[fruit] = amount_by_fruit.get(
             fruit, fruit_item.FruitItem(fruit, 0)
         ) + fruit_item.FruitItem(fruit, int(amount))
 
-    def _process_eof(self):
+    def _process_eof(self, client_id):
         logging.info(f"Broadcasting data messages")
-        for final_fruit_item in self.amount_by_fruit.values():
+        amount_by_fruit = self.amount_by_fruit_by_client.get(client_id, {})
+        for final_fruit_item in amount_by_fruit.values():
             for data_output_exchange in self.data_output_exchanges:
                 data_output_exchange.send(
                     message_protocol.internal.serialize(
-                        [final_fruit_item.fruit, final_fruit_item.amount]
+                        message_protocol.internal.build_sum_data(
+                            client_id,
+                            final_fruit_item.fruit,
+                            final_fruit_item.amount,
+                        )
                     )
                 )
 
         logging.info(f"Broadcasting EOF message")
         for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([]))
+            data_output_exchange.send(
+                message_protocol.internal.serialize(
+                    message_protocol.internal.build_sum_eof(client_id)
+                )
+            )
+
+        self.amount_by_fruit_by_client.pop(client_id, None)
 
 
     def process_data_messsage(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
+        parsed_message = message_protocol.internal.parse_sum_message(fields)
+        if parsed_message[0] == "data":
+            _, client_id, fruit, amount = parsed_message
+            self._process_data(client_id, fruit, amount)
+        elif parsed_message[0] == "eof":
+            _, client_id = parsed_message
+            self._process_eof(client_id)
         else:
-            self._process_eof(*fields)
+            raise ValueError(f"Invalid message format for sum: {fields}")
         ack()
 
     def start(self):
