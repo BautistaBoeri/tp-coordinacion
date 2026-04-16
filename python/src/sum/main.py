@@ -1,28 +1,36 @@
 import os
 import logging
+import threading
 
 from common import middleware, message_protocol, fruit_item
 
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
-SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
 SUM_PREFIX = os.environ["SUM_PREFIX"]
-SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
+SUM_FLUSH_EXCHANGE = f"{SUM_PREFIX}_flush"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
+
 class SumFilter:
     def __init__(self):
-        self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-            MOM_HOST, INPUT_QUEUE
+        self._lock = threading.Lock()
+
+        self.queue_consumer = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
+        self.fanout_publisher = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, SUM_FLUSH_EXCHANGE, [], exchange_type="fanout"
         )
-        self.data_output_exchanges = []
-        for i in range(AGGREGATION_AMOUNT):
-            data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+        self.fanout_consumer = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, SUM_FLUSH_EXCHANGE, [], exchange_type="fanout"
+        )
+
+        self.data_output_exchanges = [
+            middleware.MessageMiddlewareExchangeRabbitMQ(
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             )
-            self.data_output_exchanges.append(data_output_exchange)
+            for i in range(AGGREGATION_AMOUNT)
+        ]
         self.amount_by_fruit_by_client = {}
 
     def _get_client_amount_by_fruit(self, client_id):
@@ -30,19 +38,12 @@ class SumFilter:
             self.amount_by_fruit_by_client[client_id] = {}
         return self.amount_by_fruit_by_client[client_id]
 
-    def _process_data(self, _client_id, fruit, amount):
-        logging.info(f"Process data")
-        amount_by_fruit = self._get_client_amount_by_fruit(_client_id)
-        amount_by_fruit[fruit] = amount_by_fruit.get(
-            fruit, fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(amount))
-
-    def _process_eof(self, client_id):
-        logging.info(f"Broadcasting data messages")
+    def _flush_client(self, client_id):
+        logging.info(f"Flushing state for client {client_id}")
         amount_by_fruit = self.amount_by_fruit_by_client.get(client_id, {})
         for final_fruit_item in amount_by_fruit.values():
-            for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(
+            for exchange in self.data_output_exchanges:
+                exchange.send(
                     message_protocol.internal.serialize(
                         message_protocol.internal.build_sum_data(
                             client_id,
@@ -51,33 +52,53 @@ class SumFilter:
                         )
                     )
                 )
-
-        logging.info(f"Broadcasting EOF message")
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(
+        for exchange in self.data_output_exchanges:
+            exchange.send(
                 message_protocol.internal.serialize(
                     message_protocol.internal.build_sum_eof(client_id)
                 )
             )
-
         self.amount_by_fruit_by_client.pop(client_id, None)
 
-
-    def process_data_messsage(self, message, ack, nack):
+    def process_data_message(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
-        parsed_message = message_protocol.internal.parse_sum_message(fields)
-        if parsed_message[0] == "data":
-            _, client_id, fruit, amount = parsed_message
-            self._process_data(client_id, fruit, amount)
-        elif parsed_message[0] == "eof":
-            _, client_id = parsed_message
-            self._process_eof(client_id)
-        else:
-            raise ValueError(f"Invalid message format for sum: {fields}")
+        parsed = message_protocol.internal.parse_sum_message(fields)
+        if parsed[0] == "data":
+            _, client_id, fruit, amount = parsed
+            with self._lock:
+                amount_by_fruit = self._get_client_amount_by_fruit(client_id)
+                amount_by_fruit[fruit] = amount_by_fruit.get(
+                    fruit, fruit_item.FruitItem(fruit, 0)
+                ) + fruit_item.FruitItem(fruit, int(amount))
+        elif parsed[0] == "client_eof":
+            _, client_id = parsed
+            logging.info(f"Received client EOF for {client_id}, broadcasting flush")
+            self.fanout_publisher.send(
+                message_protocol.internal.serialize(
+                    message_protocol.internal.build_sum_eof(client_id)
+                )
+            )
+        ack()
+
+    def process_flush(self, message, ack, nack):
+        fields = message_protocol.internal.deserialize(message)
+        parsed = message_protocol.internal.parse_sum_message(fields)
+        _, client_id = parsed
+        with self._lock:
+            self._flush_client(client_id)
         ack()
 
     def start(self):
-        self.input_queue.start_consuming(self.process_data_messsage)
+        flush_thread = threading.Thread(
+            target=self.fanout_consumer.start_consuming,
+            args=(self.process_flush,),
+            kwargs={"queue_name": f"{SUM_FLUSH_EXCHANGE}_{ID}"},
+            daemon=True,
+        )
+        flush_thread.start()
+        self.queue_consumer.start_consuming(self.process_data_message)
+        flush_thread.join()
+
 
 def main():
     logging.basicConfig(level=logging.INFO)

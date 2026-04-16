@@ -17,6 +17,10 @@ def build_sum_eof(client_id):
     return [client_id]
 
 
+def build_sum_targeted_eof(client_id, target_sum_id):
+    return [client_id, target_sum_id]
+
+
 def build_aggregation_partial(client_id, fruit_top):
     return [client_id, fruit_top]
 
@@ -24,8 +28,10 @@ def build_aggregation_partial(client_id, fruit_top):
 def parse_sum_message(fields):
     if len(fields) == 3:
         return ("data", fields[0], fields[1], fields[2])
+    if len(fields) == 2 and isinstance(fields[1], int):
+        return ("targeted_eof", fields[0], fields[1])
     if len(fields) == 1:
-        return ("eof", fields[0])
+        return ("client_eof", fields[0])
     raise ValueError(f"Invalid sum message format: {fields}")
 
 

@@ -83,19 +83,21 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
         if close_error is not None:
             raise MessageMiddlewareCloseError() from close_error
 
+
 class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
 
-    def __init__(self, host, exchange_name, routing_keys):
+    def __init__(self, host, exchange_name, routing_keys, exchange_type='direct'):
         self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
         self.channel = self.connection.channel()
-        self.channel.exchange_declare(exchange=exchange_name, exchange_type='direct', durable=True)
+        self.channel.exchange_declare(exchange=exchange_name, exchange_type=exchange_type, durable=True)
         self.channel.confirm_delivery()
         self.exchange_name = exchange_name
         self.routing_keys = routing_keys
 
     def send(self, message):
         try:
-            for routing_key in self.routing_keys:
+            keys = self.routing_keys if self.routing_keys else [""]
+            for routing_key in keys:
                 self.channel.basic_publish(
                     exchange=self.exchange_name,
                     routing_key=routing_key,
@@ -109,14 +111,20 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
         except Exception as exc:
             raise MessageMiddlewareMessageError() from exc
 
-    def start_consuming(self, on_message_callback):
+    def start_consuming(self, on_message_callback, queue_name=None):
         try:
-            result = self.channel.queue_declare(queue='', exclusive=True)
-            queue_name = result.method.queue
+            if queue_name:
+                self.channel.queue_declare(queue=queue_name, durable=True, arguments={'x-queue-type': 'quorum'})
+            else:
+                result = self.channel.queue_declare(queue='', exclusive=True)
+                queue_name = result.method.queue
 
-            for routing_key in self.routing_keys:
-                self.channel.queue_bind(exchange=self.exchange_name, queue=queue_name, routing_key=routing_key)
-            
+            if self.routing_keys:
+                for routing_key in self.routing_keys:
+                    self.channel.queue_bind(exchange=self.exchange_name, queue=queue_name, routing_key=routing_key)
+            else:
+                self.channel.queue_bind(exchange=self.exchange_name, queue=queue_name)
+
             self.channel.basic_consume(
                 queue=queue_name,
                 on_message_callback=_build_callback(on_message_callback)

@@ -24,6 +24,7 @@ class AggregationFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
         self.fruit_top_by_client = {}
+        self.eof_count_by_client = {}
 
     def _get_client_fruit_top(self, client_id):
         if client_id not in self.fruit_top_by_client:
@@ -42,8 +43,19 @@ class AggregationFilter:
                 return
         bisect.insort(client_fruit_top, fruit_item.FruitItem(fruit, amount))
 
+    
+
     def _process_eof(self, client_id):
-        logging.info("Received EOF")
+        self.eof_count_by_client[client_id] = (
+            self.eof_count_by_client.get(client_id, 0) + 1
+        )
+        logging.info(
+            f"Received EOF {self.eof_count_by_client[client_id]}/{SUM_AMOUNT} "
+            f"for client {client_id}"
+        )
+        if self.eof_count_by_client[client_id] < SUM_AMOUNT:
+            return
+        self.eof_count_by_client.pop(client_id, None)
         client_fruit_top = self.fruit_top_by_client.get(client_id, [])
         fruit_chunk = list(client_fruit_top[-TOP_SIZE:])
         fruit_chunk.reverse()
@@ -67,7 +79,7 @@ class AggregationFilter:
         if parsed_message[0] == "data":
             _, client_id, fruit, amount = parsed_message
             self._process_data(client_id, fruit, amount)
-        elif parsed_message[0] == "eof":
+        elif parsed_message[0] == "client_eof":
             _, client_id = parsed_message
             self._process_eof(client_id)
         else:
