@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+import hashlib
 
 from common import middleware, message_protocol, fruit_item
 
@@ -13,6 +14,9 @@ AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
 
+def _get_aggregation_index(fruit, amount):
+    return int(hashlib.md5(fruit.encode()).hexdigest(), 16) % amount
+
 class SumFilter:
     def __init__(self):
         self._lock = threading.Lock()
@@ -23,14 +27,10 @@ class SumFilter:
         )
         self.fanout_consumer = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_FLUSH_EXCHANGE, [], exchange_type="fanout"
+        )                                                             
+        self.data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}" for i in range(AGGREGATION_AMOUNT)]
         )
-
-        self.data_output_exchanges = [
-            middleware.MessageMiddlewareExchangeRabbitMQ(
-                MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
-            )
-            for i in range(AGGREGATION_AMOUNT)
-        ]
         self.amount_by_fruit_by_client = {}
 
     def _get_client_amount_by_fruit(self, client_id):
@@ -42,22 +42,19 @@ class SumFilter:
         logging.info(f"Flushing state for client {client_id}")
         amount_by_fruit = self.amount_by_fruit_by_client.get(client_id, {})
         for final_fruit_item in amount_by_fruit.values():
-            for exchange in self.data_output_exchanges:
-                exchange.send(
-                    message_protocol.internal.serialize(
-                        message_protocol.internal.build_sum_data(
-                            client_id,
-                            final_fruit_item.fruit,
-                            final_fruit_item.amount,
-                        )
+            aggregation_index = _get_aggregation_index(final_fruit_item.fruit, AGGREGATION_AMOUNT)
+            self.data_output_exchange.send_to(f"{AGGREGATION_PREFIX}_{aggregation_index}",
+                message_protocol.internal.serialize(
+                    message_protocol.internal.build_sum_data(
+                        client_id, final_fruit_item.fruit, final_fruit_item.amount
                     )
                 )
-        for exchange in self.data_output_exchanges:
-            exchange.send(
-                message_protocol.internal.serialize(
-                    message_protocol.internal.build_sum_eof(client_id)
-                )
             )
+        self.data_output_exchange.send(
+            message_protocol.internal.serialize(
+                message_protocol.internal.build_sum_eof(client_id)
+            )
+        )       
         self.amount_by_fruit_by_client.pop(client_id, None)
 
     def process_data_message(self, message, ack, nack):

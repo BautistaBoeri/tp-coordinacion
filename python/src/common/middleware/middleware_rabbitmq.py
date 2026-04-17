@@ -110,6 +110,21 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
             raise MessageMiddlewareDisconnectedError() from exc
         except Exception as exc:
             raise MessageMiddlewareMessageError() from exc
+        
+    def send_to(self, routing_key, message):
+        try:
+            self.channel.basic_publish(
+                exchange=self.exchange_name,
+                routing_key=routing_key,
+                body=message,
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.DeliveryMode.Persistent,
+                )
+            )
+        except DISCONNECTED_EXCEPTIONS as exc:
+            raise MessageMiddlewareDisconnectedError() from exc
+        except Exception as exc:
+            raise MessageMiddlewareMessageError() from exc      
 
     def start_consuming(self, on_message_callback, queue_name=None):
         try:
