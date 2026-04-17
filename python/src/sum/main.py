@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 import threading
 import hashlib
 
@@ -32,12 +33,7 @@ class SumFilter:
             MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}" for i in range(AGGREGATION_AMOUNT)]
         )
         self.amount_by_fruit_by_client = {}
-
-    def _get_client_amount_by_fruit(self, client_id):
-        if client_id not in self.amount_by_fruit_by_client:
-            self.amount_by_fruit_by_client[client_id] = {}
-        return self.amount_by_fruit_by_client[client_id]
-
+        
     def _flush_client(self, client_id):
         logging.info(f"Flushing state for client {client_id}")
         amount_by_fruit = self.amount_by_fruit_by_client.get(client_id, {})
@@ -63,7 +59,9 @@ class SumFilter:
         if parsed[0] == "data":
             _, client_id, fruit, amount = parsed
             with self._lock:
-                amount_by_fruit = self._get_client_amount_by_fruit(client_id)
+                if client_id not in self.amount_by_fruit_by_client:
+                    self.amount_by_fruit_by_client[client_id] = {}
+                amount_by_fruit = self.amount_by_fruit_by_client[client_id]
                 amount_by_fruit[fruit] = amount_by_fruit.get(
                     fruit, fruit_item.FruitItem(fruit, 0)
                 ) + fruit_item.FruitItem(fruit, int(amount))
@@ -85,6 +83,10 @@ class SumFilter:
             self._flush_client(client_id)
         ack()
 
+    def stop(self):
+        self.queue_consumer.stop_consuming()
+        self.fanout_consumer.stop_consuming()
+
     def start(self):
         flush_thread = threading.Thread(
             target=self.fanout_consumer.start_consuming,
@@ -100,6 +102,7 @@ class SumFilter:
 def main():
     logging.basicConfig(level=logging.INFO)
     sum_filter = SumFilter()
+    signal.signal(signal.SIGTERM, lambda _s, _f: sum_filter.stop())
     sum_filter.start()
     return 0
 

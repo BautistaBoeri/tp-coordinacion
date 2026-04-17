@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 import bisect
 
 from common import middleware, message_protocol, fruit_item
@@ -86,6 +87,9 @@ class AggregationFilter:
             raise ValueError(f"Invalid message format for aggregation: {fields}")
         ack()
 
+    def stop(self):
+        self.input_exchange.stop_consuming()
+
     def start(self):
         self.input_exchange.start_consuming(self.process_messsage)
 
@@ -93,6 +97,7 @@ class AggregationFilter:
 def main():
     logging.basicConfig(level=logging.INFO)
     aggregation_filter = AggregationFilter()
+    signal.signal(signal.SIGTERM, lambda _s, _f: aggregation_filter.stop())
     aggregation_filter.start()
     return 0
 
