@@ -28,9 +28,17 @@ def _build_callback(on_message_callback):
 
 class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
-    def __init__(self, host, queue_name):
-        self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
-        self.channel = self.connection.channel()
+    def __init__(self, host, queue_name, connection=None, channel=None):
+        if connection is None:
+            self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
+        else:
+            self.connection = connection
+
+        if channel is None:
+            self.channel = self.connection.channel()
+        else:
+            self.channel = channel
+
         self.channel.queue_declare(queue=queue_name, durable=True, arguments={'x-queue-type': 'quorum'})
         self.channel.confirm_delivery()
         self.queue_name = queue_name
@@ -86,9 +94,17 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
 class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
 
-    def __init__(self, host, exchange_name, routing_keys, exchange_type='direct'):
-        self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
-        self.channel = self.connection.channel()
+    def __init__(self, host, exchange_name, routing_keys, exchange_type='direct', connection=None, channel=None):
+        if connection is None:
+            self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
+        else:
+            self.connection = connection
+
+        if channel is None:
+            self.channel = self.connection.channel()
+        else:
+            self.channel = channel
+
         self.channel.exchange_declare(exchange=exchange_name, exchange_type=exchange_type, durable=True)
         self.channel.confirm_delivery()
         self.exchange_name = exchange_name
@@ -170,3 +186,49 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
 
         if close_error is not None:
             raise MessageMiddlewareCloseError() from close_error
+        
+class SumMiddleware():
+    def __init__(self, host, input_queue, fanout_exchange, fanout_queue_name):
+        self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
+        self.channel = self.connection.channel()
+        self.channel.basic_qos(prefetch_count=1)
+
+        self._input_queue_name = input_queue
+        self._fanout_queue_name = fanout_queue_name
+
+        self._input = MessageMiddlewareQueueRabbitMQ(host, input_queue, self.connection, self.channel)
+        self._fanout_consumer = MessageMiddlewareExchangeRabbitMQ(host, fanout_exchange, [], exchange_type='fanout', connection=self.connection, channel=self.channel)
+        self._fanout_publisher = MessageMiddlewareExchangeRabbitMQ(host, fanout_exchange, [], exchange_type='fanout')
+
+    def send_fanout(self, message):
+        self._fanout_publisher.send(message)
+
+    def start_consuming(self, data_callback, flush_callback):
+        try:
+            self.channel.queue_declare(queue=self._fanout_queue_name, exclusive=True)
+            self.channel.queue_bind(exchange=self._fanout_consumer.exchange_name, queue=self._fanout_queue_name)
+            self.channel.basic_consume(
+                queue=self._input_queue_name,
+                on_message_callback=_build_callback(data_callback)
+            )
+            self.channel.basic_consume(
+                queue=self._fanout_queue_name,
+                on_message_callback=_build_callback(flush_callback)
+            )
+            self.channel.start_consuming()
+        except DISCONNECTED_EXCEPTIONS as exc:
+            raise MessageMiddlewareDisconnectedError() from exc
+        except Exception as exc:
+            raise MessageMiddlewareMessageError() from exc
+
+    def stop_consuming(self):
+        error = None
+        for consumer in (self._input, self._fanout_consumer):
+            try:
+                consumer.stop_consuming()
+            except Exception as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
+        

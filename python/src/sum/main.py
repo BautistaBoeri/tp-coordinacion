@@ -1,7 +1,6 @@
 import os
 import logging
 import signal
-import threading
 import hashlib
 
 from common import middleware, message_protocol, fruit_item
@@ -20,15 +19,10 @@ def _get_aggregation_index(fruit, amount):
 
 class SumFilter:
     def __init__(self):
-        self._lock = threading.Lock()
 
-        self.queue_consumer = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
-        self.fanout_publisher = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_FLUSH_EXCHANGE, [], exchange_type="fanout"
-        )
-        self.fanout_consumer = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_FLUSH_EXCHANGE, [], exchange_type="fanout"
-        )                                                             
+        self.sum_middleware = middleware.SumMiddleware(
+            MOM_HOST, INPUT_QUEUE, SUM_FLUSH_EXCHANGE, f"{SUM_FLUSH_EXCHANGE}_{ID}"
+        )                                                          
         self.data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}" for i in range(AGGREGATION_AMOUNT)]
         )
@@ -58,17 +52,16 @@ class SumFilter:
         parsed = message_protocol.internal.parse_sum_message(fields)
         if parsed[0] == "data":
             _, client_id, fruit, amount = parsed
-            with self._lock:
-                if client_id not in self.amount_by_fruit_by_client:
-                    self.amount_by_fruit_by_client[client_id] = {}
-                amount_by_fruit = self.amount_by_fruit_by_client[client_id]
-                amount_by_fruit[fruit] = amount_by_fruit.get(
-                    fruit, fruit_item.FruitItem(fruit, 0)
-                ) + fruit_item.FruitItem(fruit, int(amount))
+            if client_id not in self.amount_by_fruit_by_client:
+                self.amount_by_fruit_by_client[client_id] = {}
+            amount_by_fruit = self.amount_by_fruit_by_client[client_id]
+            amount_by_fruit[fruit] = amount_by_fruit.get(
+                fruit, fruit_item.FruitItem(fruit, 0)
+            ) + fruit_item.FruitItem(fruit, int(amount))
         elif parsed[0] == "client_eof":
             _, client_id = parsed
             logging.info(f"Received client EOF for {client_id}, broadcasting flush")
-            self.fanout_publisher.send(
+            self.sum_middleware.send_fanout(
                 message_protocol.internal.serialize(
                     message_protocol.internal.build_sum_eof(client_id)
                 )
@@ -79,25 +72,14 @@ class SumFilter:
         fields = message_protocol.internal.deserialize(message)
         parsed = message_protocol.internal.parse_sum_message(fields)
         _, client_id = parsed
-        with self._lock:
-            self._flush_client(client_id)
+        self._flush_client(client_id)
         ack()
 
     def stop(self):
-        self.queue_consumer.stop_consuming()
-        self.fanout_consumer.stop_consuming()
+        self.sum_middleware.stop_consuming()
 
     def start(self):
-        flush_thread = threading.Thread(
-            target=self.fanout_consumer.start_consuming,
-            args=(self.process_flush,),
-            kwargs={"queue_name": f"{SUM_FLUSH_EXCHANGE}_{ID}"},
-            daemon=True,
-        )
-        flush_thread.start()
-        self.queue_consumer.start_consuming(self.process_data_message)
-        flush_thread.join()
-
+        self.sum_middleware.start_consuming(self.process_data_message, self.process_flush)
 
 def main():
     logging.basicConfig(level=logging.INFO)
