@@ -110,10 +110,9 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
         self.exchange_name = exchange_name
         self.routing_keys = routing_keys
 
-    def send(self, message):
+    def send(self, message, routing_key=None):
         try:
-            keys = self.routing_keys if self.routing_keys else [""]
-            for routing_key in keys:
+            if routing_key is not None:
                 self.channel.basic_publish(
                     exchange=self.exchange_name,
                     routing_key=routing_key,
@@ -122,25 +121,22 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
                         delivery_mode=pika.DeliveryMode.Persistent,
                     )
                 )
+            else:
+                keys = self.routing_keys if self.routing_keys else [""]
+                for routing_key in keys:
+                    self.channel.basic_publish(
+                        exchange=self.exchange_name,
+                        routing_key=routing_key,
+                        body=message,
+                        properties=pika.BasicProperties(
+                            delivery_mode=pika.DeliveryMode.Persistent,
+                        )
+                    )
         except DISCONNECTED_EXCEPTIONS as exc:
             raise MessageMiddlewareDisconnectedError() from exc
         except Exception as exc:
             raise MessageMiddlewareMessageError() from exc
-        
-    def send_to(self, routing_key, message):
-        try:
-            self.channel.basic_publish(
-                exchange=self.exchange_name,
-                routing_key=routing_key,
-                body=message,
-                properties=pika.BasicProperties(
-                    delivery_mode=pika.DeliveryMode.Persistent,
-                )
-            )
-        except DISCONNECTED_EXCEPTIONS as exc:
-            raise MessageMiddlewareDisconnectedError() from exc
-        except Exception as exc:
-            raise MessageMiddlewareMessageError() from exc      
+          
 
     def start_consuming(self, on_message_callback, queue_name=None):
         try:

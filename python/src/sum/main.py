@@ -33,12 +33,13 @@ class SumFilter:
         amount_by_fruit = self.amount_by_fruit_by_client.get(client_id, {})
         for final_fruit_item in amount_by_fruit.values():
             aggregation_index = _get_aggregation_index(final_fruit_item.fruit, AGGREGATION_AMOUNT)
-            self.data_output_exchange.send_to(f"{AGGREGATION_PREFIX}_{aggregation_index}",
+            self.data_output_exchange.send(
                 message_protocol.internal.serialize(
                     message_protocol.internal.build_sum_data(
                         client_id, final_fruit_item.fruit, final_fruit_item.amount
                     )
-                )
+                ),
+                routing_key=f"{AGGREGATION_PREFIX}_{aggregation_index}"
             )
         self.data_output_exchange.send(
             message_protocol.internal.serialize(
