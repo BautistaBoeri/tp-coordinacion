@@ -79,3 +79,30 @@ Al momento de la evaluación y ejecución de las pruebas se **descartarán** o *
 - La implementación del protocolo de comunicación externo y `FruitItem`.
 
 Redactar un breve informe explicando el modo en que se coordinan las instancias de Sum y Aggregation, así como el modo en el que el sistema escala respecto a los clientes y a la cantidad de controles.
+
+## Informe
+
+### Coordinación entre instancias de Sum
+
+Las instancias de `Sum` actúan como *competing consumers* sobre una única cola de trabajo (`input_queue`), de modo que cada registro `(fruta, cantidad)` lo procesa exactamente una réplica. Cada réplica mantiene un estado parcial por cliente (`amount_by_fruit_by_client`), acumulando su porción de los datos.
+
+El problema es que el EOF de un cliente llega a **una sola** réplica por la naturaleza de la cola de trabajo, mientras el resto conserva estado que también debe volcarse. Para resolverlo se usa un **exchange fanout** (`{SUM_PREFIX}_flush`) al que cada réplica se suscribe mediante una cola propia `{SUM_PREFIX}_flush_{ID}`. Cuando una réplica recibe el EOF de cliente, publica una notificación de *flush* en ese exchange; todas las réplicas la reciben y vuelcan su estado parcial para ese `client_id`, enviando luego su propio EOF hacia Aggregation.
+
+Ambos consumidores (trabajo y *flush*) comparten **un único canal de Pika con `prefetch_count=1`**, lo que garantiza serialización: no puede entregarse un *flush* mientras un registro de datos está siendo procesado, evitando la race condition donde una réplica volcaba estado antes de procesar un mensaje ya desencolado.
+
+### Coordinación entre instancias de Aggregation
+
+Cada `Sum`, al volcar su estado, particiona sus resultados por fruta mediante `hash(fruta) % AGGREGATION_AMOUNT` y los envía a la instancia de Aggregation correspondiente a través de un **direct exchange** con una routing key por réplica. Así, cada fruta queda asignada determinísticamente a una única instancia de Aggregation, eliminando procesamiento redundante.
+
+Los EOFs, en cambio, se envían a **todas** las instancias de Aggregation. Cada Aggregation lleva un contador `eof_count_by_client` y recién cuando recibe `SUM_AMOUNT` EOFs para un cliente considera cerrada la ingesta de ese cliente, calcula su top parcial y lo envía al `Join`.
+
+El `Join`, a su vez, espera `AGGREGATION_AMOUNT` tops parciales por cliente antes de consolidar y enviar el top final al gateway.
+
+### Escalabilidad
+
+- **Respecto a los clientes**: el estado de todos los filtros (`Sum`, `Aggregation`, `Join`) está indexado por `client_id`, por lo que varios clientes pueden ser procesados en el pipeline en paralelo sin interferencia.
+
+- **Respecto a la cantidad de controles**: `SUM_AMOUNT` y `AGGREGATION_AMOUNT` son variables de entorno del `docker-compose`. Al cambiar sus valores:
+  - Las réplicas de `Sum` se balancean solas gracias a la cola compartida.
+  - Las réplicas de `Aggregation` se direccionan automáticamente porque Sum computa el índice con el módulo sobre `AGGREGATION_AMOUNT` y publica con la routing key correspondiente.
+  - `Join` ajusta dinámicamente cuántos parciales espera usando `AGGREGATION_AMOUNT`, y cada Aggregation cuántos EOFs espera usando `SUM_AMOUNT`.

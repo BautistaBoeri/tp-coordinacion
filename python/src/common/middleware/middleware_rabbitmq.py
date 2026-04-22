@@ -218,13 +218,26 @@ class SumMiddleware():
             raise MessageMiddlewareMessageError() from exc
 
     def stop_consuming(self):
-        error = None
-        for consumer in (self._input, self._fanout_consumer):
+        try:
+            if self.channel.is_open:
+                self.channel.stop_consuming()
+        except DISCONNECTED_EXCEPTIONS as exc:
+            raise MessageMiddlewareDisconnectedError() from exc
+
+    def close(self):
+        close_error = None
+        for resource in (self.channel, self.connection):
             try:
-                consumer.stop_consuming()
+                if resource.is_open:
+                    resource.close()
             except Exception as exc:
-                if error is None:
-                    error = exc
-        if error is not None:
-            raise error
+                if close_error is None:
+                    close_error = exc
+        try:
+            self._fanout_publisher.close()
+        except Exception as exc:
+            if close_error is None:
+                close_error = exc
+        if close_error is not None:
+            raise MessageMiddlewareCloseError() from close_error
         

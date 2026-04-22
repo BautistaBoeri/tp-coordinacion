@@ -79,6 +79,10 @@ class SumFilter:
     def stop(self):
         self.sum_middleware.stop_consuming()
 
+    def close(self):
+        self.sum_middleware.close()
+        self.data_output_exchange.close()
+
     def start(self):
         self.sum_middleware.start_consuming(self.process_data_message, self.process_flush)
 
@@ -86,7 +90,10 @@ def main():
     logging.basicConfig(level=logging.INFO)
     sum_filter = SumFilter()
     signal.signal(signal.SIGTERM, lambda _s, _f: sum_filter.stop())
-    sum_filter.start()
+    try:
+        sum_filter.start()
+    finally:
+        sum_filter.close()
     return 0
 
 
