@@ -86,9 +86,16 @@ Redactar un breve informe explicando el modo en que se coordinan las instancias 
 
 Las instancias de `Sum` actúan como *competing consumers* sobre una única cola de trabajo (`input_queue`), de modo que cada registro `(fruta, cantidad)` lo procesa exactamente una réplica. Cada réplica mantiene un estado parcial por cliente (`amount_by_fruit_by_client`), acumulando su porción de los datos.
 
-El problema es que el EOF de un cliente llega a **una sola** réplica por la naturaleza de la cola de trabajo, mientras el resto conserva estado que también debe volcarse. Para resolverlo se usa un **exchange fanout** (`{SUM_PREFIX}_flush`) al que cada réplica se suscribe mediante una cola propia `{SUM_PREFIX}_flush_{ID}`. Cuando una réplica recibe el EOF de cliente, publica una notificación de *flush* en ese exchange; todas las réplicas la reciben y vuelcan su estado parcial para ese `client_id`, enviando luego su propio EOF hacia Aggregation.
+El problema es que el EOF de un cliente llega a **una sola** réplica, mientras el resto conserva estado que también debe volcarse. La solución se basa en un **protocolo de conteo**: el gateway lleva la cuenta de cuántos registros envió por cliente e incluye ese total en el mensaje de EOF. Cuando una réplica recibe el EOF, lo difunde por un **exchange fanout** (`{SUM_PREFIX}_flush`) junto con el total. Cada réplica tiene una cola exclusiva (`{SUM_PREFIX}_flush_{ID}`) vinculada a ese exchange.
 
-Ambos consumidores (trabajo y *flush*) comparten **un único canal de Pika con `prefetch_count=1`**, lo que garantiza serialización: no puede entregarse un *flush* mientras un registro de datos está siendo procesado, evitando la race condition donde una réplica volcaba estado antes de procesar un mensaje ya desencolado.
+Cada réplica corre **dos threads independientes**, cada uno con su propia conexión pika:
+
+- **T1 (datos)**: consume `input_queue`. Al recibir el EOF del gateway, publica el broadcast con el total al fanout. Mientras tanto, por cada registro procesado *después* de haber recibido el broadcast, actualiza su conteo local y publica un `partial_count` al fanout.
+- **T2 (flush)**: consume la cola exclusiva del fanout. Al recibir el broadcast, registra el total esperado y publica su `partial_count` actual. Al recibir `partial_count` de cualquier réplica (incluyendo los propios reenviados por el fanout), actualiza `peer_counts[sum_id]` y evalúa la condición de convergencia: `sum(peer_counts.values()) == total`. Cuando se cumple, vuelca el estado parcial a Aggregation y envía el EOF correspondiente.
+
+Un `threading.Lock` protege el estado compartido entre T1 y T2. La correctitud se apoya en que `sum(peer_counts) == total` solo puede alcanzarse cuando todas las réplicas han terminado de procesar sus mensajes: si alguna aún tiene datos pendientes, su conteo reportado es menor y la suma queda por debajo del total.
+
+Aunque Python tiene un *Global Interpreter Lock* (GIL) que impide paralelismo real entre threads, en este caso el uso de threads sigue siendo beneficioso: ambos threads pasan la mayor parte del tiempo bloqueados esperando mensajes de RabbitMQ (operación de I/O), momento en el que liberan el GIL. Esto permite que mientras T1 espera un nuevo mensaje en `input_queue`, T2 pueda procesar simultáneamente un `partial_count` del fanout, y viceversa.
 
 ### Coordinación entre instancias de Aggregation
 
