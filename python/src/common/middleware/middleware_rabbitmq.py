@@ -28,17 +28,9 @@ def _build_callback(on_message_callback):
 
 class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
-    def __init__(self, host, queue_name, connection=None, channel=None):
-        if connection is None:
-            self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
-        else:
-            self.connection = connection
-
-        if channel is None:
-            self.channel = self.connection.channel()
-        else:
-            self.channel = channel
-
+    def __init__(self, host, queue_name):
+        self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
+        self.channel = self.connection.channel()
         self.channel.queue_declare(queue=queue_name, durable=True, arguments={'x-queue-type': 'quorum'})
         self.channel.confirm_delivery()
         self.queue_name = queue_name
@@ -93,17 +85,9 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
 class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
 
-    def __init__(self, host, exchange_name, routing_keys, exchange_type='direct', connection=None, channel=None):
-        if connection is None:
-            self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
-        else:
-            self.connection = connection
-
-        if channel is None:
-            self.channel = self.connection.channel()
-        else:
-            self.channel = channel
-
+    def __init__(self, host, exchange_name, routing_keys, exchange_type='direct'):
+        self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=host))
+        self.channel = self.connection.channel()
         self.channel.exchange_declare(exchange=exchange_name, exchange_type=exchange_type, durable=True)
         self.channel.confirm_delivery()
         self.exchange_name = exchange_name

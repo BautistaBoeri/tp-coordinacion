@@ -91,8 +91,10 @@ class AggregationFilter:
         self.input_exchange.stop_consuming()
 
     def close(self):
-        self.input_exchange.close()
-        self.output_queue.close()
+        try: self.input_exchange.close()
+        except middleware.MessageMiddlewareCloseError: pass
+        try: self.output_queue.close()
+        except middleware.MessageMiddlewareCloseError: pass
 
     def start(self):
         self.input_exchange.start_consuming(self.process_messsage)

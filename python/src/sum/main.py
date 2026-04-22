@@ -160,7 +160,6 @@ class SumFilter:
         input_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
         flush_publisher = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_FLUSH_EXCHANGE, [], exchange_type='fanout',
-            connection=input_queue.connection, channel=input_queue.channel,
         )
 
         self._data_connection = input_queue.connection
@@ -171,10 +170,10 @@ class SumFilter:
                 lambda m, a, n: self._on_data_message(m, a, n, flush_publisher)
             )
         finally:
-            try:
-                input_queue.close()
-            except Exception:
-                pass
+            try: flush_publisher.close()
+            except middleware.MessageMiddlewareCloseError: pass
+            try: input_queue.close()
+            except middleware.MessageMiddlewareCloseError: pass
 
     def _run_flush_thread(self):
         flush_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
@@ -184,7 +183,6 @@ class SumFilter:
             MOM_HOST, AGGREGATION_PREFIX,
             [f"{AGGREGATION_PREFIX}_{i}" for i in range(AGGREGATION_AMOUNT)],
             exchange_type='direct',
-            connection=flush_exchange.connection, channel=flush_exchange.channel,
         )
 
         self._flush_connection = flush_exchange.connection
@@ -196,10 +194,10 @@ class SumFilter:
                 queue_name=SUM_FLUSH_QUEUE,
             )
         finally:
-            try:
-                flush_exchange.close()
-            except Exception:
-                pass
+            try: agg_publisher.close()
+            except middleware.MessageMiddlewareCloseError: pass
+            try: flush_exchange.close()
+            except middleware.MessageMiddlewareCloseError: pass
 
     def start(self):
         data_thread = threading.Thread(target=self._run_data_thread, name="sum-data")

@@ -74,8 +74,10 @@ class JoinFilter:
         self.input_queue.stop_consuming()
 
     def close(self):
-        self.input_queue.close()
-        self.output_queue.close()
+        try: self.input_queue.close()
+        except middleware.MessageMiddlewareCloseError: pass
+        try: self.output_queue.close()
+        except middleware.MessageMiddlewareCloseError: pass
 
     def start(self):
         self.input_queue.start_consuming(self.process_messsage)
