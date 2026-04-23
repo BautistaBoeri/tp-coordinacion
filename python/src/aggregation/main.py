@@ -76,15 +76,13 @@ class AggregationFilter:
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")
         fields = message_protocol.internal.deserialize(message)
-        parsed_message = message_protocol.internal.parse_sum_message(fields)
+        parsed_message = message_protocol.internal.parse_sum_to_aggregation(fields)
         if parsed_message[0] == "data":
             _, client_id, fruit, amount = parsed_message
             self._process_data(client_id, fruit, amount)
-        elif parsed_message[0] == "client_eof":
+        elif parsed_message[0] == "sum_eof":
             _, client_id = parsed_message
             self._process_eof(client_id)
-        else:
-            raise ValueError(f"Invalid message format for aggregation: {fields}")
         ack()
 
     def stop(self):
