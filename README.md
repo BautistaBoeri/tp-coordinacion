@@ -86,12 +86,18 @@ Redactar un breve informe explicando el modo en que se coordinan las instancias 
 
 Las instancias de `Sum` actúan como *competing consumers* sobre una única cola de trabajo (`input_queue`), de modo que cada registro `(fruta, cantidad)` lo procesa exactamente una réplica. Cada réplica mantiene un estado parcial por cliente (`amount_by_fruit_by_client`), acumulando su porción de los datos.
 
-El problema es que el EOF de un cliente llega a **una sola** réplica, mientras el resto conserva estado que también debe volcarse. La solución se basa en un **protocolo de conteo**: el gateway lleva la cuenta de cuántos registros envió por cliente e incluye ese total en el mensaje de EOF. Cuando una réplica recibe el EOF, lo difunde por un **exchange fanout** (`{SUM_PREFIX}_flush`) junto con el total. Cada réplica tiene una cola exclusiva (`{SUM_PREFIX}_flush_{ID}`) vinculada a ese exchange.
+El problema es que el EOF de un cliente llega a **una sola** réplica, mientras el resto conserva estado que también debe volcarse. La solución se basa en un **protocolo de conteo**: el gateway lleva la cuenta de cuántos registros envió por cliente e incluye ese total en el mensaje de EOF. Cuando una réplica recibe el EOF, lo difunde por un canal de broadcast interno implementado con un **exchange fanout**, de modo que todas las réplicas de `Sum` converjan sobre el mismo objetivo de cierre por cliente.
 
-Cada réplica corre **dos threads independientes**, cada uno con su propia conexión pika:
+Cada réplica corre **dos threads independientes**, cada uno con su propia conexión pika: el thread principal consume una **input queue** (`input_queue`) y un thread adicional consume los mensajes de control que llegan desde el **exchange fanout** de flush.
 
-- **T1 (datos)**: consume `input_queue`. Al recibir el EOF del gateway, publica el broadcast con el total al fanout. Mientras tanto, por cada registro procesado *después* de haber recibido el broadcast, actualiza su conteo local y publica un `partial_count` al fanout.
-- **T2 (flush)**: consume la cola exclusiva del fanout. Al recibir el broadcast, registra el total esperado y publica su `partial_count` actual. Al recibir `partial_count` de cualquier réplica (incluyendo los propios reenviados por el fanout), actualiza `peer_counts[sum_id]` y evalúa la condición de convergencia: `sum(peer_counts.values()) == total`. Cuando se cumple, vuelca el estado parcial a Aggregation y envía el EOF correspondiente.
+- **T1 (datos, thread principal)**: consume desde la **input queue**. Al recibir el EOF del gateway, publica el broadcast con el total esperado en el **exchange fanout**. Por cada registro procesado *después* de ese punto, incrementa su conteo local y publica un `partial_count` actualizado.
+- **T2 (flush, thread adicional)**: consume el flujo de control proveniente del **exchange fanout**. Al recibir el broadcast, registra el total esperado y publica su `partial_count` actual. Al recibir `partial_count` de cualquier réplica actualiza `peer_counts[sum_id]` y evalúa la condición de convergencia: `sum(peer_counts.values()) == total`. Cuando se cumple, vuelca el estado parcial a Aggregation y envía el EOF correspondiente.
+
+Conviene notar que la condición de convergencia no exige que *todas* las réplicas hayan reportado: exige que la suma de los reportes existentes iguale al total. Una réplica que nunca procesó datos del cliente contribuye 0 al total real, por lo que su reporte es redundante para alcanzar la condición. Aun así el protocolo hace que cada réplica emita su conteo al recibir el broadcast (incluso si es 0), por uniformidad del flujo.
+
+La convergencia se evalúa **únicamente** al recibir un `partial_count`, incluyendo los mensajes propios que retornan por el canal de control. Esto simplifica el protocolo: hay un único camino de detección de convergencia en lugar de uno por cada forma de recibir información.
+
+Una vez volcado el estado de un cliente, su `client_id` queda registrado en el set `flushed`. Los procesadores de mensajes (datos, broadcast, partial_count) cortocircuitan inmediatamente si el cliente ya fue flusheado. Esto protege contra `partial_count` tardíos que lleguen después de la convergencia y hace el protocolo idempotente por cliente.
 
 Un `threading.Lock` protege el estado compartido entre T1 y T2. La correctitud se apoya en que `sum(peer_counts) == total` solo puede alcanzarse cuando todas las réplicas han terminado de procesar sus mensajes: si alguna aún tiene datos pendientes, su conteo reportado es menor y la suma queda por debajo del total.
 
@@ -110,6 +116,21 @@ El `Join`, a su vez, espera `AGGREGATION_AMOUNT` tops parciales por cliente ante
 - **Respecto a los clientes**: el estado de todos los filtros (`Sum`, `Aggregation`, `Join`) está indexado por `client_id`, por lo que varios clientes pueden ser procesados en el pipeline en paralelo sin interferencia.
 
 - **Respecto a la cantidad de controles**: `SUM_AMOUNT` y `AGGREGATION_AMOUNT` son variables de entorno del `docker-compose`. Al cambiar sus valores:
-  - Las réplicas de `Sum` se balancean solas gracias a la cola compartida.
+  - Las réplicas de `Sum` se balancean solas gracias a la cola compartida. Ademas, el protocolo de conteo es independiente de la cantidad de réplicas, ya que el total esperado se incluye en el broadcast y cada réplica reporta su conteo sin importar cuántas sean.
   - Las réplicas de `Aggregation` se direccionan automáticamente porque Sum computa el índice con el módulo sobre `AGGREGATION_AMOUNT` y publica con la routing key correspondiente.
   - `Join` ajusta dinámicamente cuántos parciales espera usando `AGGREGATION_AMOUNT`, y cada Aggregation cuántos EOFs espera usando `SUM_AMOUNT`.
+
+### Alternativas consideradas para la coordinación de Sum
+
+Antes de llegar al protocolo de conteo actual se probaron otros enfoques, que se dejan documentados acá porque cada uno muestra un *trade-off* distinto.
+
+#### Dos threads con channels independientes (race condition)
+
+La versión inicial tenía dos threads por réplica, cada uno con su propio channel: uno consumía `input_queue` y otro la cola del exchange fanout de flush. El problema era una race condition: un `Sum` podía recibir el broadcast de flush y volcar su estado **antes** de terminar de procesar un registro que ya había sido entregado por `input_queue` y todavía estaba en vuelo, perdiéndolo del procesamiento y permitiendo que se envien datos al `Aggregator` que no habían sido sumados, lo que a su vez podía generar resultados incorrectos en el top final.
+
+#### Un único channel con `prefetch_count=1` (serialización forzada)
+
+Para evitar la race se introdujo un wrapper (`SumMiddleware`) que multiplexaba en un **único channel de pika** el consumo de ambas colas, con `prefetch_count=1`. Así, mientras un registro estuviera sin ackear, el broker no entregaba el mensaje de flush. Es correcto, pero tiene dos problemas:
+
+- `prefetch_count=1` serializa por completo el consumo sobre ese channel, anulando gran parte del beneficio de tener réplicas.
+- Si un dia se cambia la implementacion de rabbitmq y cambia el comportamiento, perdemos la garantía de correctitud sin darnos cuenta y ya no funcionaria correctamente.
