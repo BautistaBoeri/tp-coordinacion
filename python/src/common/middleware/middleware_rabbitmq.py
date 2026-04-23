@@ -69,6 +69,13 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
             except DISCONNECTED_EXCEPTIONS as exc:
                 raise MessageMiddlewareDisconnectedError() from exc
 
+    def stop_consuming_threadsafe(self):
+        if self.connection.is_open:
+            try:
+                self.connection.add_callback_threadsafe(lambda: self.stop_consuming())
+            except DISCONNECTED_EXCEPTIONS as exc:
+                raise MessageMiddlewareDisconnectedError() from exc
+
     def close(self):
         close_error = None
         for resource in (self.channel, self.connection):
@@ -151,6 +158,13 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
                 self.channel.stop_consuming()
         except DISCONNECTED_EXCEPTIONS as exc:
             raise MessageMiddlewareDisconnectedError() from exc
+
+    def stop_consuming_threadsafe(self):
+        if self.connection.is_open:
+            try:
+                self.connection.add_callback_threadsafe(lambda: self.stop_consuming())
+            except DISCONNECTED_EXCEPTIONS as exc:
+                raise MessageMiddlewareDisconnectedError() from exc
         
             
     def close(self):

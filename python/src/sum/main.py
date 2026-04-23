@@ -31,7 +31,6 @@ class SumFilter:
         self.flushed = set()
 
         self._data_consumer = None
-        self._flush_connection = None
         self._flush_consumer = None
 
 
@@ -182,7 +181,6 @@ class SumFilter:
             exchange_type='direct',
         )
 
-        self._flush_connection = flush_exchange.connection
         self._flush_consumer = flush_exchange
 
         try:
@@ -206,15 +204,20 @@ class SumFilter:
 
     def stop(self):
         if self._data_consumer is not None:
-            self._data_consumer.stop_consuming()
-
-        if self._flush_connection is not None and self._flush_consumer is not None:
             try:
-                self._flush_connection.add_callback_threadsafe(
-                    lambda: self._flush_consumer.stop_consuming()
-                )
-            except Exception as exc:
-                logging.error(f"error scheduling flush stop: {exc}")
+                self._data_consumer.stop_consuming()
+            except middleware.MessageMiddlewareDisconnectedError as exc:
+                logging.warning(f"data consumer disconnected while stopping: {exc}")
+            except Exception:
+                logging.exception("unexpected error stopping data consumer")
+
+        if self._flush_consumer is not None:
+            try:
+                self._flush_consumer.stop_consuming_threadsafe()
+            except middleware.MessageMiddlewareDisconnectedError as exc:
+                logging.warning(f"flush consumer disconnected while scheduling stop: {exc}")
+            except Exception:
+                logging.exception("unexpected error scheduling flush stop")
 
 
 
